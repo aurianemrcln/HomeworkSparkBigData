@@ -1,12 +1,14 @@
 package fr.esilv;
 
+import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.SparkSession;
 import static org.apache.spark.sql.functions.*;
-import java.io.File;
 
+import java.io.File;
+import java.util.Arrays;
 
 public class DailyIntegration {
     private final SparkSession spark;
@@ -21,17 +23,21 @@ public class DailyIntegration {
         System.out.println("Running Integration for date: " + date);
 
         // 1. Read Today's CSV
-        // French BAL files usually use semicolon ';' separator
         Dataset<Row> todayRaw = spark.read()
                 .option("header", "true")
                 .option("delimiter", ";")
-                .option("inferSchema", "true") // safer for first run, can utilize schema for perf
+                .option("inferSchema", "true")
                 .csv(csvFile);
 
-        // Add a Hash column to detect content changes efficiently
-        // We assume 'id' is the unique primary key. We hash everything else.
-        // If the CSV structure changes, this grabs all columns.
-        Dataset<Row> today = todayRaw.withColumn("hash", sha2(concat_ws("||", todayRaw.columns()), 256));
+        // --- CORRECTION ICI ---
+        // On convertit les noms de colonnes (String[]) en objets (Column[])
+        Column[] cols = Arrays.stream(todayRaw.columns())
+                              .map(c -> col(c))
+                              .toArray(Column[]::new);
+
+        // On utilise ce tableau de Colonnes pour le hash
+        Dataset<Row> today = todayRaw.withColumn("hash", sha2(concat_ws("||", cols), 256));
+        // ----------------------
 
         // 2. Read Previous State
         Dataset<Row> previous;
@@ -41,18 +47,15 @@ public class DailyIntegration {
             System.out.println("No existing data found. Initializing full load.");
             // On first run, everything is an INSERT
             Dataset<Row> initialDiff = today.withColumn("action", lit("INSERT"))
-                                            .withColumn("day", lit(date)); // Partition column
+                                            .withColumn("day", lit(date)); 
             
-            // Write Diff
             initialDiff.write().mode(SaveMode.Append).partitionBy("day").parquet(DIFF_PATH);
-            
-            // Write Latest
             today.drop("hash").write().mode(SaveMode.Overwrite).parquet(LATEST_PATH);
             return;
         } else {
             previous = spark.read().parquet(LATEST_PATH)
-                    // Re-calculate hash for previous data to be safe (or store hash in latest)
-                    .withColumn("hash", sha2(concat_ws("||", todayRaw.columns()), 256));
+                    // On recalcule le hash pour être sûr (en utilisant les mêmes colonnes)
+                    .withColumn("hash", sha2(concat_ws("||", cols), 256));
         }
 
         // 3. Compute Differences
@@ -67,7 +70,6 @@ public class DailyIntegration {
                 .withColumn("action", lit("DELETE"));
 
         // UPDATES: ID in both, but Hash is different
-        // We take the 'new' values from today
         Dataset<Row> updates = today.alias("new")
                 .join(previous.alias("old"), "id")
                 .filter(col("new.hash").notEqual(col("old.hash")))
@@ -76,10 +78,9 @@ public class DailyIntegration {
 
         // 4. Union all changes
         Dataset<Row> allDiffs = inserts.union(updates).union(deletes)
-                .withColumn("day", lit(date)); // Add partition column
+                .withColumn("day", lit(date)); 
 
         // 5. Save Diff (Partitioned by day)
-        // We drop 'hash' before saving to save space, it's recalculated on load
         allDiffs.drop("hash")
                 .write()
                 .mode(SaveMode.Append)
@@ -89,8 +90,6 @@ public class DailyIntegration {
         System.out.println("Diff saved. Inserts: " + inserts.count() + ", Updates: " + updates.count() + ", Deletes: " + deletes.count());
 
         // 6. Update 'bal_latest' (Snapshot)
-        // The new state is simply Today's CSV content.
-        // We overwrite the old snapshot.
         today.drop("hash").write().mode(SaveMode.Overwrite).parquet(LATEST_PATH);
     }
 }

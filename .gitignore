@@ -1,1 +1,4 @@
-adresses-france.csv
+/data/*
+/data_generated/*
+/bal_latest/*
+/bal.db/*
