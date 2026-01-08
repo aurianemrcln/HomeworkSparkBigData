@@ -1,4 +1,5 @@
-/data/*
-/data_generated/*
-/bal_latest/*
-/bal.db/*
+data/*
+data_generated/*
+bal_latest/*
+bal.db/*
+target/*

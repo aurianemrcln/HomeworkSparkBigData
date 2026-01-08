@@ -16,9 +16,9 @@ public class SparkMain {
 
         SparkSession spark = SparkSession.builder()
                 .appName("BAL Project - " + jobType)
-                // In production/cluster, remove .master("local[*]") and let spark-submit handle it
-                // For dev/testing on PC, keep it or pass it via spark-submit
                 .getOrCreate();
+        
+        spark.sparkContext().setLogLevel("ERROR");
 
         try {
             switch (jobType) {

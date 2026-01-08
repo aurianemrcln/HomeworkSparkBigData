@@ -14,10 +14,12 @@ public class DumpRecomputer {
 
     public DumpRecomputer(SparkSession spark) {
         this.spark = spark;
+
+        this.spark.sparkContext().setLogLevel("ERROR");
     }
 
     public void run(String targetDate, String outputDir) {
-        System.out.println("Recomputing Dump for date: " + targetDate);
+        System.out.println("--- Recomputing Dump for date: " + targetDate);
 
         // 1. Load all diffs up to the target date
         Dataset<Row> history = spark.read().parquet(DIFF_PATH)
@@ -26,7 +28,7 @@ public class DumpRecomputer {
         // 2. Reduce logic: Get the LATEST action for every ID
         // We partition by ID and order by date descending to find the most recent change
         Dataset<Row> snapshot = history
-                .withColumn("rn", row_number().over(Window.partitionBy("id").orderBy(col("day").desc())))
+                .withColumn("rn", row_number().over(Window.partitionBy("cle_interop").orderBy(col("day").desc())))
                 .filter(col("rn").equalTo(1)) // Keep only the latest entry
                 .filter(col("action").notEqual("DELETE")) // Remove if the last action was DELETE
                 .drop("rn", "action", "day"); // Clean up metadata columns
