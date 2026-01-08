@@ -11,7 +11,8 @@ public class DumpRecomputer {
     private final SparkSession spark;
     private static final String DIFF_PATH = "bal.db/bal_diff";
     private static final String LATEST_PATH = "bal_latest";
-    private static final String TRUTH_BASE_DIR = "data_generated";
+    // Adapte ce chemin si besoin (ex: "C:/temp/data")
+    private static final String TRUTH_BASE_DIR = "data_generated"; 
 
     public DumpRecomputer(SparkSession spark) {
         this.spark = spark;
@@ -21,135 +22,133 @@ public class DumpRecomputer {
     public void run(String targetDate, String outputDir) {
         System.out.println("=== Recomputing Dump for " + targetDate + " ===");
 
-        // 1. Charger l'état actuel (C'est notre point de départ, le "Futur")
-        // On lui donne une date fictive très lointaine pour qu'il soit toujours considéré "après" les diffs
-        Dataset<Row> current = spark.read().parquet(LATEST_PATH)
+        // 1. Charger l'état actuel (Le Futur)
+        // On lit bal_latest
+        Dataset<Row> currentRaw = spark.read().parquet(LATEST_PATH);
+        
+        long countCurrent = currentRaw.count();
+        System.out.println("--- DEBUG: Lignes chargees depuis bal_latest (Etat final) : " + countCurrent);
+        
+        if (countCurrent == 0) {
+            System.err.println("!!! ALERTE : bal_latest est vide ! La reconstruction sera incomplete.");
+        }
+
+        Dataset<Row> current = currentRaw
                 .withColumn("day", lit("9999-12-31"))
-                .withColumn("action", lit("KEEP")); // Action fictive pour dire "c'est la donnée actuelle"
+                .withColumn("action", lit("KEEP"));
 
-        // 2. Charger l'historique inverse (seulement ce qui s'est passé APRÈS la targetDate)
-        // Ce sont les "instructions de retour en arrière"
+        // 2. Charger l'historique inverse (Diffs APRES la date cible)
         Dataset<Row> reverseHistory = spark.read().parquet(DIFF_PATH)
-                .filter(col("day").gt(targetDate)); // STRICTEMENT SUPÉRIEUR à la date cible
+                .filter(col("day").gt(targetDate));
+        
+        System.out.println("--- DEBUG: Lignes d'historique (Diffs) a appliquer : " + reverseHistory.count());
 
-        // 3. Union : On met l'état actuel et l'historique dans le même Dataset
-        // unionByName permet de gérer les colonnes qui pourraient ne pas être dans le même ordre
+        // 3. Union : On combine tout
+        // On force l'union par nom pour éviter les décalages de colonnes
         Dataset<Row> allData = current.unionByName(reverseHistory, true);
 
-        // --- ÉTAPE 2 : Vérification de cohérence (Preuve par 9) ---
-        // Logique : (État reconstruit à Date X) + (Diffs entre X et Aujourd'hui) == (bal_latest)
-        
-        System.out.println("\n=== Consistency Check (Verification) ===");
-        System.out.println("--- Replaying history from NOW to " + targetDate);
-
+        // 4. Logique Time Travel (Le plus proche du passé, trié par date ASC)
+        // Exemple : Si on veut l'état au 3 Janvier.
+        // On a une ligne du 4 Janvier (Diff) et une du Futur (9999).
+        // Le tri ASC met le 4 Janvier en premier. C'est l'état le plus proche.
         Dataset<Row> snapshot = allData
                 .withColumn("rn", row_number().over(
-                        Window.partitionBy("cle_interop") // On groupe par ID unique
-                              .orderBy(col("day").asc())  // IMPORTANT : On cherche la date la plus petite (la plus proche du passé)
+                        Window.partitionBy("cle_interop") 
+                              .orderBy(col("day").asc()) 
                 ))
-                .filter(col("rn").equalTo(1)) // On ne garde que la version la plus proche de la target
-                .filter(col("action").notEqual("DELETE")) // Si l'instruction inverse est "DELETE", ça veut dire que la donnée n'existait pas encore à cette date (C'était un Insert dans le futur)
-                .drop("rn", "action", "day"); // On nettoie les colonnes techniques
-        
-        // On met le résultat en cache car on va s'en servir deux fois (Save + Verify)
+                .filter(col("rn").equalTo(1)) // On garde le 1er (le plus proche de la cible)
+                .filter(col("action").notEqual("DELETE")) // Si l'action la plus proche est "DELETE", la donnée n'existait pas.
+                .drop("rn", "action", "day");
+
+        // Cache pour la suite
         snapshot.cache();
 
-        // 5. Sauvegarde du résultat
+        // 5. Sauvegarde
         snapshot.write().mode(SaveMode.Overwrite).parquet(outputDir);
-        
-        System.out.println("--- Dump reconstruit avec succes pour le " + targetDate);
-        System.out.println("--- Sortie enregistree dans : " + outputDir);
+        System.out.println("--- Dump reconstruit sauvegarde dans : " + outputDir);
 
+        // --- VERIFICATIONS ---
+        verifyWithTruth(targetDate, snapshot);
+        
+        snapshot.unpersist();        
+    }
+
+    private void verifyWithTruth(String targetDate, Dataset<Row> snapshot) {
         System.out.println("\n--- VERIFICATIONS ---");
+        String truthFile = TRUTH_BASE_DIR + "/dump-" + targetDate + ".csv"; // ou /dump-{date}/adresses.csv selon ton générateur
+        // Note: Si ton script generate_data.sh crée des dossiers dump-YYYY-MM-DD, vérifie le chemin ici.
+        // Souvent c'est : TRUTH_BASE_DIR + "/dump-" + targetDate + "/adresses.csv"
         
-        String truthFile = TRUTH_BASE_DIR + "/dump-" + targetDate + ".csv";
-        
+        // Tentative de correction automatique du chemin si le fichier simple n'existe pas
+        java.io.File f = new java.io.File(truthFile);
+        if (!f.exists()) {
+             truthFile = TRUTH_BASE_DIR + "/dump-" + targetDate + "/adresses.csv";
+        }
+
         try {
-            // A. Lecture du VRAI fichier CSV de cette date
             Dataset<Row> truthRaw = spark.read()
                     .option("header", "true")
                     .option("delimiter", ";")
                     .option("inferSchema", "true")
                     .csv(truthFile);
             
-            // On s'assure d'avoir les colonnes nécessaires (cle_interop, etc.)
-            // On suppose que les colonnes 'commune', 'voie', 'code_postal' existent pour les stats
-            
-            // Calcul des stats pour le fichier RECONSTRUIT
             Stats computedStats = computeStats(snapshot);
-            
-            // Calcul des stats pour le fichier VRAI (ORIGINAL)
             Stats truthStats = computeStats(truthRaw);
 
-            // Affichage du tableau comparatif
             printComparisonTable(computedStats, truthStats);
 
-            // Vérification stricte
             if (computedStats.equals(truthStats)) {
                  System.out.println("\nSUCCES : Les statistiques correspondent parfaitement.");
             } else {
-                 System.err.println("\nATTENTION : Il y a des divergences dans les statistiques.");
+                 System.err.println("\nATTENTION : Divergences detectees !");
             }
 
         } catch (Exception e) {
-            System.out.println("⚠️ Impossible d'effectuer la verification complete (Fichier CSV introuvable ou erreur de lecture).");
-            System.out.println("   Erreur : " + e.getMessage());
+            System.out.println("⚠️ Verification impossible (Fichier introuvable : " + truthFile + ")");
         }
-        
-        snapshot.unpersist();        
     }
 
+    // --- Classes Stats ---
+
     private static class Stats {
-        long count;
-        long cities;
-        long streets;
-        long depts;
-
-        // Constructeur simple
+        long count, cities, streets, depts;
         public Stats(long c, long ci, long s, long d) {
-            this.count = c; this.cities = ci; this.streets = s; this.depts = d;
+            this.count=c; this.cities=ci; this.streets=s; this.depts=d;
         }
-
-        // Pour comparer facilement
-        public boolean equals(Stats other) {
-            return count == other.count && cities == other.cities && streets == other.streets && depts == other.depts;
+        public boolean equals(Stats o) {
+            return count==o.count && cities==o.cities && streets==o.streets && depts==o.depts;
         }
     }
 
     private Stats computeStats(Dataset<Row> df) {
-        // On s'assure que code_postal est vu comme string pour extraire les 2 premiers chars
-        Dataset<Row> dfWithDept = df.withColumn("dept_ext", substring(col("commune_insee").cast("string"), 1, 2));
-        
-        // Aggregation en une seule passe pour être efficace
-        Row result = dfWithDept.agg(
+        // Correction du substring (1, 2) pour les 2 premiers caractères
+        // Cast en string pour être sûr (commune_insee est souvent un int)
+        Dataset<Row> dfClean = df.withColumn("dept_str", substring(col("commune_insee").cast("string"), 1, 2));
+
+        Row r = dfClean.select(
             count("*"),
             countDistinct("commune_insee"),
             countDistinct("voie_nom"),
-            countDistinct(substring(col("commune_insee"), 0, 2).alias("dept"))
+            countDistinct("dept_str")
         ).first();
 
-        return new Stats(result.getLong(0), result.getLong(1), result.getLong(2), result.getLong(3));
+        return new Stats(r.getLong(0), r.getLong(1), r.getLong(2), r.getLong(3));
     }
 
-    private void printComparisonTable(Stats computed, Stats truth) {
+    private void printComparisonTable(Stats c, Stats t) {
         System.out.println("\n+===================================================================+");
         System.out.println("|                 COMPARAISON AVEC LE CSV ORIGINAL                  |");
         System.out.println("+--------------------------+--------------------+-------------------+");
         System.out.println("| METRIQUE                 | CALCULE (Spark)    | REEL (CSV Orig.)  |");
         System.out.println("+--------------------------+--------------------+-------------------+");
-        
-        printRow("Nombre d'adresses", computed.count, truth.count);
-        printRow("Nombre de villes", computed.cities, truth.cities);
-        printRow("Noms de rues distincts", computed.streets, truth.streets);
-        printRow("Nombre de departements", computed.depts, truth.depts);
-        
+        printRow("Nombre d'adresses", c.count, t.count);
+        printRow("Nombre de villes", c.cities, t.cities);
+        printRow("Noms de rues distincts", c.streets, t.streets);
+        printRow("Nombre de departements", c.depts, t.depts);
         System.out.println("+===================================================================+");
     }
 
-    private void printRow(String label, long val1, long val2) {
-        System.out.printf("| %-24s | %18d | %17d |\n", label, val1, val2);
+    private void printRow(String l, long v1, long v2) {
+        System.out.printf("| %-24s | %18d | %17d |\n", l, v1, v2);
     }
 }
-
-
-// modifie le code dans le fichier DumpRecomputer.java pour qu'il charge au début la version de la date demandé, repasse l'historique du jour demandé jusqu'à aujourd'hui comme ce que la fonction fait actuellement, puis compare ce qui a été trouvé avec le vrai fichier qui était enregistré, sachant que je ne peux pas prendre un troisième paramètre quand j'appelle mes fonctions donc il faut que j'arrive à récupérer le fichier le plus récent

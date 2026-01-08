@@ -3,3 +3,4 @@ data_generated/*
 bal_latest/*
 bal.db/*
 target/*
+bal_recomputed/*

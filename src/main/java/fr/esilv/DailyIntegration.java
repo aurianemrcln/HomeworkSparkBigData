@@ -9,137 +9,148 @@ import static org.apache.spark.sql.functions.*;
 
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.FileUtil; 
 import java.io.IOException;
 import java.util.Arrays;
 
 public class DailyIntegration {
     private final SparkSession spark;
+    
+    // Chemins des données
     private static final String LATEST_PATH = "bal_latest";
+    private static final String BUFFER_PATH = "bal_processing_buffer"; // Zone de lecture sécurisée
     private static final String DIFF_PATH = "bal.db/bal_diff";
 
     public DailyIntegration(SparkSession spark) {
         this.spark = spark;
-        // pour éviter que trop de logs s'affichent
         this.spark.sparkContext().setLogLevel("ERROR");
     }
 
     public void run(String date, String csvFile) {
-        System.out.println("--- Running reverse integration for " + date);
+        System.out.println("=== Running Daily Integration (Reverse Logic) for " + date + " ===");
 
         try {
-            // Configuration du FileSystem Hadoop pour gérer les dossiers proprement
             FileSystem fs = FileSystem.get(spark.sparkContext().hadoopConfiguration());
             Path latestPath = new Path(LATEST_PATH);
+            Path bufferPath = new Path(BUFFER_PATH);
+
+            // ==============================================================================
+            // ETAPE 0 : SAFETY BUFFER (Contournement du verrouillage fichier Windows)
+            // ==============================================================================
+            // On copie l'état actuel vers un tampon pour le lire tranquillement.
+            // Cela permet d'écraser 'bal_latest' plus tard sans conflit de lecture/écriture.
             
-            // 1. Lecture du CSV du jour
+            if (fs.exists(bufferPath)) {
+                fs.delete(bufferPath, true); // Nettoyage préventif
+            }
+            
+            boolean isFirstRun = !fs.exists(latestPath);
+            if (!isFirstRun) {
+                // Copie physique de bal_latest -> bal_processing_buffer
+                FileUtil.copy(fs, latestPath, fs, bufferPath, false, spark.sparkContext().hadoopConfiguration());
+            }
+
+            // ==============================================================================
+            // ETAPE 1 : Chargement des données
+            // ==============================================================================
+            
+            // A. Lecture du CSV du jour (TODAY)
             Dataset<Row> todayRaw = spark.read()
                     .option("header", "true")
                     .option("delimiter", ";")
                     .option("inferSchema", "true")
                     .csv(csvFile);
 
+            // Calcul du Hash sur toutes les colonnes pour détecter les modifs
             Column[] cols = Arrays.stream(todayRaw.columns())
                                 .map(c -> col(c))
                                 .toArray(Column[]::new);
 
             Dataset<Row> today = todayRaw.withColumn("hash", sha2(concat_ws("||", cols), 256));
 
-            // 2. Lecture de l'état précédent
+            // B. Lecture de l'état précédent (PREVIOUS) depuis le BUFFER
             Dataset<Row> previous;
-            boolean isFirstRun = !fs.exists(latestPath);
-
-            // System.out.println("--- AAAAAAAAAAAAAAAAAAA");
 
             if (isFirstRun) {
-                System.out.println("--- No existing data found. Initializing full load.");
+                System.out.println("--- Premier lancement detecte. Initialisation...");
                 
+                // Si c'est le jour 1, l'historique inverse pour revenir à "Rien" consiste à tout supprimer.
                 Dataset<Row> reverseDiff = today.withColumn("action", lit("DELETE"))
                                                 .withColumn("day", lit(date)); 
                 
                 reverseDiff.write().mode(SaveMode.Append).partitionBy("day").parquet(DIFF_PATH);
                 today.drop("hash").write().mode(SaveMode.Overwrite).parquet(LATEST_PATH);
 
-                printSummaryTable(date, 0, 0, today.count());
+                printSummaryTable(date, today.count(), 0, 0);
                 return;
             } else {
-                // System.out.println("--- BBBBBBBBBBBBBBBBBBBB");
-                previous = spark.read().parquet(LATEST_PATH)
+                // IMPORTANT : On lit depuis le BUFFER, pas depuis LATEST
+                previous = spark.read().parquet(BUFFER_PATH)
                         .withColumn("hash", sha2(concat_ws("||", cols), 256));
-                // System.out.println("--- CCCCCCCCCCCCCCCCCCCC");
             }
 
-            // 3. Calcul des différences inverses
-            Dataset<Row> deletes = today.join(previous, today.col("cle_interop").equalTo(previous.col("cle_interop")), "left_anti")
+            // ==============================================================================
+            // ETAPE 2 : Calcul des Différences (Logique Inverse / Reverse Delta)
+            // ==============================================================================
+            
+            // 1. REVERSE DELETE : Lignes apparues aujourd'hui (Inserts).
+            // Pour revenir en arrière, il faut les SUPPRIMER.
+            // (Lignes présentes dans TODAY mais absentes de PREVIOUS)
+            Dataset<Row> revDeletes = today.join(previous, today.col("cle_interop").equalTo(previous.col("cle_interop")), "left_anti")
                     .withColumn("action", lit("DELETE"));
 
-            Dataset<Row> inserts = previous.join(today, previous.col("cle_interop").equalTo(today.col("cle_interop")), "left_anti")
+            // 2. REVERSE INSERT : Lignes disparues aujourd'hui (Deletes).
+            // Pour revenir en arrière, il faut les RESTAURER (Insérer).
+            // (Lignes présentes dans PREVIOUS mais absentes de TODAY)
+            Dataset<Row> revInserts = previous.join(today, previous.col("cle_interop").equalTo(today.col("cle_interop")), "left_anti")
                     .withColumn("action", lit("INSERT"));
 
-            Dataset<Row> updates = today.alias("new")
+            // 3. REVERSE UPDATE : Lignes modifiées.
+            // Pour revenir en arrière, il faut restaurer l'ANCIENNE valeur (Celle de PREVIOUS).
+            Dataset<Row> revUpdates = today.alias("new")
                     .join(previous.alias("old"), "cle_interop")
                     .filter(col("new.hash").notEqual(col("old.hash")))
-                    .select("old.*")
+                    .select("old.*") // <--- ON GARDE L'ANCIENNE VALEUR
                     .withColumn("action", lit("UPDATE"));
-            
-            // System.out.println("--- DDDDDDDDDDDDDDDDDDDD");
 
-            long cInserts = inserts.count();
-            // System.out.println("--- 11111111111111111111");
-            long cUpdates = updates.count();
-            // System.out.println("--- 22222222222222222222");
-            long cDeletes = deletes.count();
-            // System.out.println("--- 33333333333333333333");
-            
-            // 4. Sauvegarde des différences
-            // Ici, Spark lit 'bal_latest' (via previous) pour calculer.
-            // Il est CRITIQUE de ne pas toucher à 'bal_latest' tant que cette étape n'est pas finie.
-            Dataset<Row> allDiffs = inserts.union(updates).union(deletes)
+            // ==============================================================================
+            // ETAPE 3 : Sauvegarde
+            // ==============================================================================
+
+            // A. Sauvegarde de l'historique (Diffs)
+            Dataset<Row> allDiffs = revInserts.union(revUpdates).union(revDeletes)
                     .withColumn("day", lit(date)); 
-            
-            // System.out.println("--- EEEEEEEEEEEEEEEEEEEEEE");
 
             allDiffs.drop("hash")
                     .write()
                     .mode(SaveMode.Append)
                     .partitionBy("day")
                     .parquet(DIFF_PATH);
+
+            // B. Mise à jour de l'état courant (Snapshot)
+            // On écrase bal_latest avec les données d'aujourd'hui.
+            // C'est sans danger car 'previous' pointe sur le dossier buffer.
+            today.drop("hash").write().mode(SaveMode.Overwrite).parquet(LATEST_PATH);
+
+            // ==============================================================================
+            // ETAPE 4 : Nettoyage et Stats
+            // ==============================================================================
+
+            // On compte AVANT de supprimer le buffer (actions Spark lazy)
+            long cNewToday      = revDeletes.count(); // Ce sont les "Inserts" du jour
+            long cDeletedToday  = revInserts.count(); // Ce sont les "Deletes" du jour
+            long cModifiedToday = revUpdates.count(); // Ce sont les "Updates" du jour
             
-            // System.out.println("--- FFFFFFFFFFFFFFFFFFFFFF");
-
-            // 5. Mise à jour du Snapshot (Pattern Staging)
-            // Au lieu d'écraser directement, on écrit dans un dossier temporaire
-            Path tempPath = new Path(LATEST_PATH + "_temp");
-
-            // System.out.println("--- GGGGGGGGGGGGGGGGGGGG");
-            
-            // Écriture dans bal_latest_temp
-            today.drop("hash").write().mode(SaveMode.Overwrite).parquet(tempPath.toString());
-
-            // System.out.println("--- HHHHHHHHHHHHHHHHHHHH");
-
-            // 6. SWAP Atomique (Échange des dossiers)
-            // Maintenant que l'écriture est finie, on peut supprimer l'ancien et renommer le nouveau
-            if (fs.exists(latestPath)) {
-                fs.delete(latestPath, true); // true = récursif
-            }
-            boolean success = fs.rename(tempPath, latestPath);
-
-            // System.out.println("--- IIIIIIIIIIIIIIIIIIIIIII");
-            
-            if (!success) {
-                System.err.println("--- WARNING: Failed to rename temp folder to latest. Data might be in " + tempPath);
+            // Suppression du buffer temporaire
+            if (fs.exists(bufferPath)) {
+                fs.delete(bufferPath, true);
             }
 
-            // System.out.println("--- JJJJJJJJJJJJJJJJJJJJ");
-
-            // 7. Affichage
-            printSummaryTable(date, cInserts, cUpdates, cDeletes);
-
-            // System.out.println("--- KKKKKKKKKKKKKKKKKKKK");
+            printSummaryTable(date, cNewToday, cModifiedToday, cDeletedToday);
 
         } catch (IOException e) {
             e.printStackTrace();
-            throw new RuntimeException("--- FileSystem error: " + e.getMessage());
+            throw new RuntimeException("--- Erreur FileSystem Hadoop : " + e.getMessage());
         }
     }
 
@@ -149,12 +160,14 @@ public class DailyIntegration {
         System.out.println("|           RECAPITULATIF JOURNALIER             |");
         System.out.println("|           Date : " + String.format("%-20s", date) + "          |");
         System.out.println("+--------------------------+---------------------+");
-        System.out.printf("| NOUVELLES (Inserts)      | %19d |\n", deletes);
+        // Note pour l'affichage :
+        // revDeletes (Action DELETE) = C'était une NOUVELLE adresse (Insert) aujourd'hui.
+        // revInserts (Action INSERT) = C'était une adresse SUPPRIMÉE (Delete) aujourd'hui.
+        System.out.printf("| NOUVELLES (Inserts)      | %19d |\n", inserts);
         System.out.printf("| MODIFIEES (Updates)      | %19d |\n", updates);
-        System.out.printf("| SUPPRIMEES (Deletes)     | %19d |\n", inserts);
+        System.out.printf("| SUPPRIMEES (Deletes)     | %19d |\n", deletes);
         System.out.println("+--------------------------+---------------------+");
         System.out.printf("| TOTAL CHANGEMENTS        | %19d |\n", total);
         System.out.println("+================================================+\n");
-        // on affiche l'inverse pour insert et delete car on est en reverse integration
     }
 }
