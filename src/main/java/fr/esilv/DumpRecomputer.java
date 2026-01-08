@@ -36,7 +36,6 @@ public class DumpRecomputer {
         // unionByName permet de gérer les colonnes qui pourraient ne pas être dans le même ordre
         Dataset<Row> allData = current.unionByName(reverseHistory, true);
 
-
         // --- ÉTAPE 2 : Vérification de cohérence (Preuve par 9) ---
         // Logique : (État reconstruit à Date X) + (Diffs entre X et Aujourd'hui) == (bal_latest)
         
