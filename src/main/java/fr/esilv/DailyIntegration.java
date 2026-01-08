@@ -24,7 +24,7 @@ public class DailyIntegration {
     }
 
     public void run(String date, String csvFile) {
-        System.out.println("--- Running Integration for date: " + date);
+        System.out.println("--- Running reverse integration for " + date);
 
         try {
             // Configuration du FileSystem Hadoop pour gérer les dossiers proprement
@@ -48,59 +48,74 @@ public class DailyIntegration {
             Dataset<Row> previous;
             boolean isFirstRun = !fs.exists(latestPath);
 
+            // System.out.println("--- AAAAAAAAAAAAAAAAAAA");
+
             if (isFirstRun) {
                 System.out.println("--- No existing data found. Initializing full load.");
-                long count = today.count();
                 
-                Dataset<Row> initialDiff = today.withColumn("action", lit("INSERT"))
+                Dataset<Row> reverseDiff = today.withColumn("action", lit("DELETE"))
                                                 .withColumn("day", lit(date)); 
                 
-                initialDiff.write().mode(SaveMode.Append).partitionBy("day").parquet(DIFF_PATH);
+                reverseDiff.write().mode(SaveMode.Append).partitionBy("day").parquet(DIFF_PATH);
                 today.drop("hash").write().mode(SaveMode.Overwrite).parquet(LATEST_PATH);
 
-                printSummaryTable(date, count, 0, 0);
+                printSummaryTable(date, 0, 0, today.count());
                 return;
             } else {
+                // System.out.println("--- BBBBBBBBBBBBBBBBBBBB");
                 previous = spark.read().parquet(LATEST_PATH)
                         .withColumn("hash", sha2(concat_ws("||", cols), 256));
+                // System.out.println("--- CCCCCCCCCCCCCCCCCCCC");
             }
 
-            // 3. Calcul des Différences (Lecture de previous)
-            Dataset<Row> inserts = today.join(previous, today.col("cle_interop").equalTo(previous.col("cle_interop")), "left_anti")
-                    .withColumn("action", lit("INSERT"));
-
-            Dataset<Row> deletes = previous.join(today, previous.col("cle_interop").equalTo(today.col("cle_interop")), "left_anti")
+            // 3. Calcul des différences inverses
+            Dataset<Row> deletes = today.join(previous, today.col("cle_interop").equalTo(previous.col("cle_interop")), "left_anti")
                     .withColumn("action", lit("DELETE"));
 
-            Dataset<Row> updates = today.alias("new")
-                    .join(previous.alias("old"), today.col("cle_interop").equalTo(previous.col("cle_interop")))
-                    .filter(col("new.hash").notEqual(col("old.hash")))
-                    .select("new.*")
-                    .withColumn("action", lit("UPDATE"));
+            Dataset<Row> inserts = previous.join(today, previous.col("cle_interop").equalTo(today.col("cle_interop")), "left_anti")
+                    .withColumn("action", lit("INSERT"));
 
+            Dataset<Row> updates = today.alias("new")
+                    .join(previous.alias("old"), "cle_interop")
+                    .filter(col("new.hash").notEqual(col("old.hash")))
+                    .select("old.*")
+                    .withColumn("action", lit("UPDATE"));
+            
+            // System.out.println("--- DDDDDDDDDDDDDDDDDDDD");
+
+            long cInserts = inserts.count();
+            // System.out.println("--- 11111111111111111111");
+            long cUpdates = updates.count();
+            // System.out.println("--- 22222222222222222222");
+            long cDeletes = deletes.count();
+            // System.out.println("--- 33333333333333333333");
+            
             // 4. Sauvegarde des différences
             // Ici, Spark lit 'bal_latest' (via previous) pour calculer.
             // Il est CRITIQUE de ne pas toucher à 'bal_latest' tant que cette étape n'est pas finie.
             Dataset<Row> allDiffs = inserts.union(updates).union(deletes)
                     .withColumn("day", lit(date)); 
+            
+            // System.out.println("--- EEEEEEEEEEEEEEEEEEEEEE");
 
             allDiffs.drop("hash")
                     .write()
                     .mode(SaveMode.Append)
                     .partitionBy("day")
                     .parquet(DIFF_PATH);
-
-            // Pour l'affichage final
-            long cInserts = inserts.count();
-            long cUpdates = updates.count();
-            long cDeletes = deletes.count();
+            
+            // System.out.println("--- FFFFFFFFFFFFFFFFFFFFFF");
 
             // 5. Mise à jour du Snapshot (Pattern Staging)
             // Au lieu d'écraser directement, on écrit dans un dossier temporaire
             Path tempPath = new Path(LATEST_PATH + "_temp");
+
+            // System.out.println("--- GGGGGGGGGGGGGGGGGGGG");
             
             // Écriture dans bal_latest_temp
             today.drop("hash").write().mode(SaveMode.Overwrite).parquet(tempPath.toString());
+
+            // System.out.println("--- HHHHHHHHHHHHHHHHHHHH");
 
             // 6. SWAP Atomique (Échange des dossiers)
             // Maintenant que l'écriture est finie, on peut supprimer l'ancien et renommer le nouveau
@@ -108,13 +123,19 @@ public class DailyIntegration {
                 fs.delete(latestPath, true); // true = récursif
             }
             boolean success = fs.rename(tempPath, latestPath);
+
+            // System.out.println("--- IIIIIIIIIIIIIIIIIIIIIII");
             
             if (!success) {
                 System.err.println("--- WARNING: Failed to rename temp folder to latest. Data might be in " + tempPath);
             }
 
+            // System.out.println("--- JJJJJJJJJJJJJJJJJJJJ");
+
             // 7. Affichage
             printSummaryTable(date, cInserts, cUpdates, cDeletes);
+
+            // System.out.println("--- KKKKKKKKKKKKKKKKKKKK");
 
         } catch (IOException e) {
             e.printStackTrace();
@@ -128,13 +149,12 @@ public class DailyIntegration {
         System.out.println("|           RECAPITULATIF JOURNALIER             |");
         System.out.println("|           Date : " + String.format("%-20s", date) + "          |");
         System.out.println("+--------------------------+---------------------+");
-        System.out.println("| TYPE DE MODIFICATION     | NOMBRE D'ADRESSES   |");
-        System.out.println("+--------------------------+---------------------+");
-        System.out.printf("| NOUVELLES (Inserts)      | %19d |\n", inserts);
+        System.out.printf("| NOUVELLES (Inserts)      | %19d |\n", deletes);
         System.out.printf("| MODIFIEES (Updates)      | %19d |\n", updates);
-        System.out.printf("| SUPPRIMEES (Deletes)     | %19d |\n", deletes);
+        System.out.printf("| SUPPRIMEES (Deletes)     | %19d |\n", inserts);
         System.out.println("+--------------------------+---------------------+");
         System.out.printf("| TOTAL CHANGEMENTS        | %19d |\n", total);
         System.out.println("+================================================+\n");
+        // on affiche l'inverse pour insert et delete car on est en reverse integration
     }
 }

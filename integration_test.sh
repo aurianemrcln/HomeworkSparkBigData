@@ -17,7 +17,7 @@
 #     # Run Feature 1: Integration
 #     ./run_daily_file_integration.sh "${day}" "${INPUT_FILE}"
     
-#     # # Run Feature 2: Report
+#     # Run Feature 2: Report
 #     ./run_report.sh
 # done
 
@@ -27,8 +27,8 @@
 # 3. Test Feature 3: Time Travel (Recompute Dump)
 echo "Testing Time Travel..."
 # Reconstruct a previous state 
-./recompute_and_extract_dump_at_date.sh "2025-01-10" "bal.db/bal_diff/day=2025-01-10"
+./recompute_and_extract_dump_at_date.sh "2025-01-03" "bal.db/bal_diff/day=2025-01-03"
 
-# 4. Test Feature 4: Diff
-echo "Comparing Dump A and Dump B..."
-./compute_diff_between_files.sh "bal.db/bal_diff/day=2025-01-05" "bal.db/bal_diff/day=2025-01-10"
+# # 4. Test Feature 4: Diff
+# echo "Comparing Dump A and Dump B..."
+# ./compute_diff_between_files.sh "bal.db/bal_diff/day=2025-01-05" "bal.db/bal_diff/day=2025-01-10"
