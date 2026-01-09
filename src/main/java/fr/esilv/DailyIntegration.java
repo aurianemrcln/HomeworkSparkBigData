@@ -66,6 +66,7 @@ public class DailyIntegration {
             Dataset<Row> todayClean = todayRaw
                     .filter(col("cle_interop").isNotNull())
                     .filter(not(col("cle_interop").contains("@")))
+                    .filter(length(col("cle_interop")).lt(50))
                     .dropDuplicates("cle_interop"); // Rejet des décalages de colonnes
 
             // Calcul du Hash sur toutes les colonnes pour détecter les modifs
