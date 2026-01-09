@@ -60,14 +60,20 @@ public class DailyIntegration {
                     .option("delimiter", ";")
                     .option("inferSchema", "true")
                     .csv(csvFile);
+            
+            // On filtre les lignes où la clé est corrompue (contient l'UID qui commence par @)
+            // On filtre aussi les lignes où la clé est null
+            Dataset<Row> todayClean = todayRaw
+                    .filter(col("cle_interop").isNotNull())
+                    .filter(not(col("cle_interop").contains("@")))
+                    .dropDuplicates("cle_interop"); // Rejet des décalages de colonnes
 
             // Calcul du Hash sur toutes les colonnes pour détecter les modifs
-            Column[] cols = Arrays.stream(todayRaw.columns())
+            Column[] cols = Arrays.stream(todayClean.columns())
                                 .map(c -> col(c))
                                 .toArray(Column[]::new);
 
-            Dataset<Row> today = todayRaw.withColumn("hash", sha2(concat_ws("||", cols), 256));
-
+            Dataset<Row> today = todayClean.withColumn("hash", sha2(concat_ws("||", cols), 256));
             // B. Lecture de l'état précédent (PREVIOUS) depuis le BUFFER
             Dataset<Row> previous;
 

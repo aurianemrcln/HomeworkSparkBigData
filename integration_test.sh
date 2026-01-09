@@ -3,6 +3,8 @@
 # # 1. Clean previous runs (Optional, to start fresh)
 # rm -rf bal_latest
 # rm -rf bal.db
+# rm -rf bal_processing_buffer
+# rm -rf bal_recomputed
 
 # # 2. Run the loop for 10 days
 # for n in $(seq 0 10); do 
@@ -26,9 +28,11 @@
 
 # 3. Test Feature 3: Time Travel (Recompute Dump)
 echo "Testing Time Travel..."
-date="2025-01-06"
-# Reconstruct a previous state 
-./recompute_and_extract_dump_at_date.sh ${date} $"bal_recomputed/day=${date}"
+for n in $(seq 0 10); do
+    date=$(date -d "2025-01-01 +${n} day" +%Y-%m-%d)
+    echo "Recomputing and extracting dump at date: ${date}"
+    ./recompute_and_extract_dump_at_date.sh ${date} $"bal_recomputed/day=${date}"
+done
 
 # # 4. Test Feature 4: Diff
 # echo "Comparing Dump A and Dump B..."

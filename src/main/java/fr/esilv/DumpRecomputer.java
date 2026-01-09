@@ -92,15 +92,34 @@ public class DumpRecomputer {
                     .option("inferSchema", "true")
                     .csv(truthFile);
             
+            Dataset<Row> truthDedup = truthRaw.dropDuplicates("cle_interop");
+
             Stats computedStats = computeStats(snapshot);
-            Stats truthStats = computeStats(truthRaw);
+            Stats truthStats = computeStats(truthDedup);
 
             printComparisonTable(computedStats, truthStats);
 
             if (computedStats.equals(truthStats)) {
-                 System.out.println("\nSUCCES : Les statistiques correspondent parfaitement.");
+                System.out.println("\nSUCCES : Les statistiques correspondent parfaitement.");
             } else {
-                 System.err.println("\nATTENTION : Divergences detectees !");
+                System.err.println("\nATTENTION : Divergences detectees !");
+                Dataset<Row> intruders = snapshot.select("cle_interop")
+                                                  .except(truthDedup.select("cle_interop"));
+                 
+                long count = intruders.count();
+                if (count > 0) {
+                    System.out.println("\n--- 🕵️ DEBUG : Voici les " + count + " adresse(s) en trop dans Spark ---");
+                    intruders.show(false);
+                    System.out.println("Ces adresses viennent probablement d'un futur non annulé (Script arrêté trop tôt ?)");
+                }
+                 
+                // Inverse (manquants)
+                Dataset<Row> missing = truthDedup.select("cle_interop")
+                                                .except(snapshot.select("cle_interop"));
+                if (missing.count() > 0) {
+                    System.out.println("\n--- 🕵️ DEBUG : Voici les adresses manquantes ---");
+                    missing.show(false);
+                }
             }
 
         } catch (Exception e) {
@@ -126,7 +145,7 @@ public class DumpRecomputer {
         Dataset<Row> dfClean = df.withColumn("dept_str", substring(col("commune_insee").cast("string"), 1, 2));
 
         Row r = dfClean.select(
-            count("*"),
+            countDistinct("cle_interop"),
             countDistinct("commune_insee"),
             countDistinct("voie_nom"),
             countDistinct("dept_str")
